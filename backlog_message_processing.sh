@@ -1,317 +1,269 @@
 #!/bin/bash
 
-#Title           :Automation_Script - Backlog in SV Message Queue
-#Description     :Take neccessary action when Backlog in SV Message Queue is found.
-#author          :Jibin Varghese
-#date            :22052023
+# Title           : backlog_message_processing.sh
+# Description     : Takes automated recovery actions when a backlog in a DB message queue is detected.
+# Author          : Jibin Varghese (Generic version by AI Assistant)
+# Version         : 2.0
+#=======================================================================================
+
+#======================================================
+#               CONFIGURATION VARIABLES
+#      (Modify these values to match your environment)
 #======================================================
 
-exec >> /u/netwdm2/backlog_monitor/backlog_message_process.log 2>&1
+# --- System & Application Paths ---
+APP_HOME="/u/netwdm2"
+ORACLE_HOME="/opt/dbms/oracle/product/11.2.0/client64"
+JAVA_HOME="/opt/java/jdk1.6.0_39"
+TNS_ADMIN="${APP_HOME}"
+# The full path to your listener control script/executable
+LISTENER_EXECUTABLE="${APP_HOME}/bin/lnplistener"
 
-export ORACLE_HOME=/opt/dbms/oracle/product/11.2.0/client64/
-export PATH=/opt/dbms/oracle/product/11.2.0/client64//bin:/usr/local/bin:/bin:/usr/bin:/usr/bin:/bin:/opt/dbms/oracle/product/11.2.0/client64//bin:/u/netwdm2/bin
-export TNS_ADMIN=/u/netwdm2
-export MAIN_HOME=/u/netwdm2
-export JAVA_HOME=/opt/java/jdk1.6.0_39/
-export RV_HOME=/opt/tib/NETWDM2/rv8.3.2
+# --- Logging ---
+LOG_DIR="${APP_HOME}/backlog_monitor"
+# The log file this script writes its own actions to.
+AUTOMATION_LOG_FILE="${LOG_DIR}/backlog_message_process.log"
+# The status log file written by the validation script (READ-ONLY for this script)
+VALIDATION_LOG_FILE="${LOG_DIR}/backlog_message_validation.log"
+# The console log for the application listener to check for errors
+LISTENER_CONSOLE_LOG="${APP_HOME}/log/lnplistener_console.log"
 
-# Set the email recipients and subject
-EMAIL_RECIPIENTS="OSS_CTL_PASE_CR@lumen.com"
-EMAIL_SUBJECT="Automation_Script - Backlog in SV Message Queue"
+# --- Database & Application ---
+DB_USER="user"
+DB_PASSWORD="pass" # IMPORTANT: Use Oracle Wallet in production
+DB_TNS_NAME="db_tns"
 
-# Define the path to the log file
-LOGFILE="/u/netwdm2/backlog_monitor/backlog_message_validation.log"
+# Table and column names for fetching stuck batches
+# IMPORTANT: Change these to match your application's schema.
+QUEUE_TABLE="sv_message_queue"
+BACKLOG_TABLE="sv_message_queue_hist"
+BATCH_COLUMN="batch_seq"
 
-# Read the last line of the log file
-LASTLINE=$(tail -n 1 $LOGFILE)
+# The URL endpoint to force reprocessing of a batch. The batch ID will be appended.
+PROCESSING_URL="http://host:port/npac?id="
+# The network port your application listener runs on
+LISTENER_PORT="9523"
+# A pipe-separated list of error patterns to search for in the listener log
+LOG_ERROR_PATTERN="lang|Exception|OutOfMemory"
 
-#############################################################Define functions
+# --- Alerting ---
+EMAIL_RECIPIENTS="your_mail@lumen.com"
+EMAIL_SUBJECT_PREFIX="[Automation Script] Backlog in SV Message Queue"
+
+# --- Behavior Tuning ---
+STUCK_THRESHOLD_MINUTES=15
+VALIDATION_SLEEP_SECONDS=60
+VALIDATION_LOOP_COUNT=4
+
+#======================================================
+#               END OF CONFIGURATION
+#======================================================
+
+# Redirect all script output to the automation log file
+exec >> ${AUTOMATION_LOG_FILE} 2>&1
+
+# Set up the environment
+export ORACLE_HOME JAVA_HOME TNS_ADMIN
+export PATH=${ORACLE_HOME}/bin:${JAVA_HOME}/bin:${PATH}:${APP_HOME}/bin
+
+# Form the database connection string
+DB_CONNECTION="${DB_USER}/${DB_PASSWORD}@${DB_TNS_NAME}"
+
+log() {
+    echo "$(date +'%Y-%m-%d %H:%M:%S') CDT - $1"
+}
+
+# --- Reusable Functions ---
+
+# Starts the application listener
 function start_listener() {
-    echo "$(date +'%Y-%m-%d %H:%M:%S') CDT - Starting listener"
-    /u/netwdm2/bin/lnplistener start
+    log "Attempting to start listener..."
+    ${LISTENER_EXECUTABLE} start
 }
 
+# Bounces (stops and starts) the application listener
 function bounce_listener() {
-    echo "$(date +'%Y-%m-%d %H:%M:%S') CDT - Bouncing listener"
-    /u/netwdm2/bin/lnplistener stop
+    log "Bouncing listener..."
+    ${LISTENER_EXECUTABLE} stop
 
-    # Check if the listener is still running
-    while netstat -an | grep 9523 >/dev/null; do
-        echo "$(date +'%Y-%m-%d %H:%M:%S') CDT - Listener still running, waiting 5 more seconds..."
+    # Wait until the port is free
+    retries=6
+    while [[ ${retries} -gt 0 ]] && netstat -an | grep -w "${LISTENER_PORT}" >/dev/null; do
+        log "Listener port ${LISTENER_PORT} is still in use. Waiting 5 seconds..."
         sleep 5
+        retries=$((retries - 1))
     done
 
-    # Start the listener
-    echo "Starting listener"
-    /u/netwdm2/bin/lnplistener start
+    if [[ ${retries} -eq 0 ]]; then
+        log "ERROR: Listener did not stop correctly. Manual intervention required."
+        # Optionally send an email here
+        exit 1
+    fi
+
+    log "Listener stopped successfully. Starting it again."
+    start_listener
 }
 
-
-function process_batch_seq() {
-    # Run the SQL query and extract the first 4 rows
-    BSC=$( sqlplus -s 'NM00/2022!NMp$wd'@cpacnmqp <<EOF
-    set heading off
-    set feedback off
-    select batch_seq, count(*) from sv_message_queue WHERE BATCH_SEQ IS NOT NULL group by batch_seq order by 1 fetch first 4 rows only;
+# Queries the DB for stuck batches and triggers reprocessing via URL
+function process_stuck_batches() {
+    log "Querying for top stuck batches..."
+    local BATCH_DATA
+    BATCH_DATA=$(sqlplus -s "${DB_CONNECTION}" <<EOF
+    set heading off feedback off pagesize 0
+    select ${BATCH_COLUMN} from ${QUEUE_TABLE} WHERE ${BATCH_COLUMN} IS NOT NULL group by ${BATCH_COLUMN} order by 1 fetch first 4 rows only;
     exit;
 EOF
 )
-
-    # Check if any values were returned
-    if [ -z "$BSC" ]; then
-        echo -e "$(date +'%Y-%m-%d %H:%M:%S') CDT - No stuck messages found while executing below  query \n\n'select batch_seq, count(*) from sv_message_queue WHERE BATCH_SEQ IS NOT NULL group by batch_seq order by 1 fetch first 4 rows only;'.\n\nIf the issue persists check whether there are any null batches and clear them post Validation." | mail -s "${EMAIL_SUBJECT}" "${EMAIL_RECIPIENTS}"
+    if [[ -z "${BATCH_DATA}" ]]; then
+        log "No non-null batch sequences found to process. Checking for null batches."
+        local null_count
+        null_count=$(sqlplus -s "${DB_CONNECTION}" <<< "set heading off feedback off pagesize 0; select count(*) from ${QUEUE_TABLE} where ${BATCH_COLUMN} is null;")
+        
+        local email_body="No stuck messages with a BATCH_SEQ found.
+If the issue persists, there might be ${null_count} messages with a NULL batch ID.
+These may require manual clearing."
+        log "${email_body}"
+        echo -e "${email_body}" | mail -s "${EMAIL_SUBJECT_PREFIX} - No Batches to Process" "${EMAIL_RECIPIENTS}"
         exit 0
     fi
 
-    # Declare an array to store the batch sequences and counts
-    declare -a batch_seqs
-    declare -a counts
-
-    # Extract the first 4 (or less) batch sequences and their counts into the arrays
-    i=0
-    while read -r line; do
-    if [[ "$line" =~ ^[[:space:]]*$ ]]; then
-    # Skip blank lines
-    continue
-    fi
-
-    # Extract the batch_seq and count from the line
-    i=$((i+1))
-    batch_seq="$(echo "$line" | awk '{print $1}')"
-    count="$(echo "$line" | awk '{print $2}')"
-
-    # Store the values in the arrays
-    batch_seqs[$i]=$batch_seq
-    counts[$i]=$count
-
-    if [ "$i" -eq 4 ]; then
-    # We have extracted the first 4 batch sequences and their counts, so exit the loop
-    break
-    fi
-    done <<< "$BSC"
-
-    # Print the batch sequences and counts
-    for ((i=1; i<=4; i++)); do
-        echo "$(date +'%Y-%m-%d %H:%M:%S') CDT - Batch Seq $i: ${batch_seqs[$i]}"
-        echo "$(date +'%Y-%m-%d %H:%M:%S') CDT - Count $i: ${counts[$i]}"
-    done
-
-    # Pass the variables with values through the URL
-    for ((i=1; i<=4; i++)); do
-    if [ -n "${batch_seqs[$i]}" ]; then
-        url="http://lxomavmap454.qintra.com:49999/npac?id=${batch_seqs[$i]}"
-        echo "$(date +'%Y-%m-%d %H:%M:%S') CDT - Passing ${batch_seqs[$i]} through URL: $url"
-        curl "$url"
-    fi
+    log "Found stuck batches. Triggering reprocessing via URL..."
+    echo "${BATCH_DATA}" | while read -r batch_id; do
+        # Trim whitespace
+        batch_id=$(echo "${batch_id}" | xargs)
+        if [[ -n "${batch_id}" ]]; then
+            local url="${PROCESSING_URL}${batch_id}"
+            log "Calling URL for batch ID ${batch_id}: ${url}"
+            curl -s -o /dev/null "$url"
+            sleep 1 # Small delay between calls
+        fi
     done
 }
 
-function validation() {
-    # Get the total number of messages to be processed
-    MESSAGE_COUNT=$( sqlplus -s 'NM00/2022!NMp$wd'@cpacnmqp <<EOF
-    set heading off
-    set feedback off
-    select count(*) from sv_message_queue_hist where delete_ts is null and insert_ts < sysdate - 15/1440;
-    exit;
-EOF
-)
+# A reusable function to check if the message count is decreasing
+# Takes the initial count as an argument
+# Returns a status string: "CLEAR", "IMPROVING", or "STUCK"
+function run_validation_check() {
+    local initial_count=$1
+    log "Starting validation. Initial count: ${initial_count}. Monitoring for $((${VALIDATION_SLEEP_SECONDS} * ${VALIDATION_LOOP_COUNT})) seconds."
 
-    # Print the message count
-    echo "$(date +'%Y-%m-%d %H:%M:%S') CDT - There are ${MESSAGE_COUNT} messages to be processed."
-    # Check if there are messages to be processed
-    if [[ ${MESSAGE_COUNT} -eq 0 ]]; then
-        # No messages to process, exit script
-        echo "$(date +'%Y-%m-%d %H:%M:%S') CDT - Current Count is Zero. No messages to process. Exiting the script"
-        exit 0
+    local latest_count=${initial_count}
+    for i in $(seq 1 ${VALIDATION_LOOP_COUNT}); do
+        sleep ${VALIDATION_SLEEP_SECONDS}
+        latest_count=$(sqlplus -s "${DB_CONNECTION}" <<< "set heading off feedback off pagesize 0; select count(*) from ${BACKLOG_TABLE} where delete_ts is null and insert_ts < sysdate - ${STUCK_THRESHOLD_MINUTES}/1440;")
+        latest_count=$(echo "${latest_count}" | xargs)
+        log "Validation check ${i}/${VALIDATION_LOOP_COUNT}: Current count is ${latest_count}."
+    done
+
+    if [[ ${latest_count} -eq 0 ]]; then
+        echo "CLEAR"
+    elif [[ ${latest_count} -lt ${initial_count} ]]; then
+        echo "IMPROVING"
     else
-        # Start loop for checking count changes
-        for i in {1..4}; do
-            sleep 60
-            NEW_MESSAGE_COUNT=$( sqlplus -s 'NM00/2022!NMp$wd'@cpacnmqp <<EOF
-            set heading off
-            set feedback off
-            select count(*) from sv_message_queue_hist where delete_ts is null and insert_ts < sysdate - 15/1440;
-            exit;
-EOF
-)
-        done
-        if [[ ${NEW_MESSAGE_COUNT} -eq 0 ]]; then
-            if [[ ${i} -eq 4 ]]; then
-                # Send an email indicating that all messages have been processed
-                echo "$(date +'%Y-%m-%d %H:%M:%S') CDT - Current Count is Zero. No messages to process. Exiting the script"
-                exit 0
-            fi
-        elif [[ ${NEW_MESSAGE_COUNT} -lt ${MESSAGE_COUNT} ]]; then
-            if [[ ${i} -eq 4 ]]; then
-                # Send an email indicating that messages are being processed automatically
-                echo "$(date +'%Y-%m-%d %H:%M:%S') CDT - Messages are being processed by listener. Exiting the script"
-                exit 0
-            fi
-        else
-            echo "$(date +'%Y-%m-%d %H:%M:%S') CDT - Messages are Stuck or increasing."
-            echo "$(date +'%Y-%m-%d %H:%M:%S') CDT - Processing Batches through URL for 2nd time"
-            process_batch_seq
-            validation2
-        fi
+        echo "STUCK"
     fi
 }
 
-function validation2() {
-    # Get the total number of messages to be processed
-    MESSAGE_COUNT2=$( sqlplus -s 'NM00/2022!NMp$wd'@cpacnmqp <<EOF
-    set heading off
-    set feedback off
-    select count(*) from sv_message_queue_hist where delete_ts is null and insert_ts < sysdate - 15/1440;
-    exit;
-EOF
-)
+# --- Main Script Logic ---
 
-    # Print the message count
-    echo "$(date +'%Y-%m-%d %H:%M:%S') CDT - There are ${MESSAGE_COUNT2} messages to be processed."
-    # Check if there are messages to be processed
-    if [[ ${MESSAGE_COUNT2} -eq 0 ]]; then
-        # No messages to process, exit script
-        echo "$(date +'%Y-%m-%d %H:%M:%S') CDT - Current Count is Zero. No messages to process. Exiting the script."
-        exit 0
-    else
-        # Start loop for checking count changes
-        for i in {1..4}; do
-            sleep 60
-            NEW_MESSAGE_COUNT2=$( sqlplus -s 'NM00/2022!NMp$wd'@cpacnmqp <<EOF
-            set heading off
-            set feedback off
-            select count(*) from sv_message_queue_hist where delete_ts is null and insert_ts < sysdate - 15/1440;
-            exit;
-EOF
-)
-        done
-        if [[ ${NEW_MESSAGE_COUNT2} -eq 0 ]]; then
-            if [[ ${i} -eq 4 ]]; then
-                # Send an email indicating that all messages have been processed
-                echo "$(date +'%Y-%m-%d %H:%M:%S') CDT - Current Count is Zero. No messages to process. Exiting the script."
-                exit 0
-            fi
-        elif [[ ${NEW_MESSAGE_COUNT2} -lt ${MESSAGE_COUNT2} ]]; then
-            if [[ ${i} -eq 4 ]]; then
-                # Send an email indicating that messages are being processed automatically
-                echo "$(date +'%Y-%m-%d %H:%M:%S') CDT - Messages are being processed by listener. Exiting the script."
-                exit 0
-            fi
-        else
-            echo "$(date +'%Y-%m-%d %H:%M:%S') CDT - Messages are Stuck or increasing even after passing them through url, bouncing the listener and trying again."
-            bounce_listener
-            echo "$(date +'%Y-%m-%d %H:%M:%S') CDT - initiating batch processing through URl for 3rd time."
-            process_batch_seq
-            final_validation
-        fi
-    fi
-}
+# Read the last line of the validation log to see if action is needed
+LASTLINE=$(tail -n 1 "${VALIDATION_LOG_FILE}")
 
-function final_validation() {
-    # Get the total number of messages to be processed
-    MESSAGE_COUNT3=$( sqlplus -s 'NM00/2022!NMp$wd'@cpacnmqp <<EOF
-    set heading off
-    set feedback off
-    select count(*) from sv_message_queue_hist where delete_ts is null and insert_ts < sysdate - 15/1440;
-    exit;
-EOF
-)
-
-    # Print the message count
-    echo "$(date +'%Y-%m-%d %H:%M:%S') CDT - There are ${MESSAGE_COUNT3} messages to be processed."
-    # Check if there are messages to be processed
-    if [[ ${MESSAGE_COUNT3} -eq 0 ]]; then
-        # No messages to process, exit script
-        echo "$(date +'%Y-%m-%d %H:%M:%S') CDT - Current Count is Zero. No messages to process. Exiting the script"
-        exit 0
-    else
-        # Start loop for checking count changes
-        for i in {1..4}; do
-            sleep 60
-            NEW_MESSAGE_COUNT3=$( sqlplus -s 'NM00/2022!NMp$wd'@cpacnmqp <<EOF
-            set heading off
-            set feedback off
-            select count(*) from sv_message_queue_hist where delete_ts is null and insert_ts < sysdate - 15/1440;
-            exit;
-EOF
-)
-        done
-        if [[ ${NEW_MESSAGE_COUNT3} -eq 0 ]]; then
-            if [[ ${i} -eq 4 ]]; then
-                # Send an email indicating that all messages have been processed
-                echo "$(date +'%Y-%m-%d %H:%M:%S') CDT - Current Count is Zero. No messages to process. Exiting the script"
-                exit 0
-            fi
-        elif [[ ${NEW_MESSAGE_COUNT3} -lt ${MESSAGE_COUNT3} ]]; then
-            if [[ ${i} -eq 4 ]]; then
-                # Send an email indicating that messages are being processed automatically
-                echo "$(date +'%Y-%m-%d %H:%M:%S') CDT - Messages are being processed by listener. Exiting the script"
-                exit 0
-            fi
-        else
-            echo "$(date +'%Y-%m-%d %H:%M:%S') CDT - Messages are Stuck or increasing. sending mail to stop the cron."
-            echo -e "$(date +'%Y-%m-%d %H:%M:%S') CDT - Backlog Was found in SV_Message queue. Messages are stuck or increasing even after passing the batches through URl and bouncing the listener. Manual Intervention is needed.\nKindly disable the backlog cron jobs on lxomavmap454 server(netwdm2). Investigate the issue and take neccessary actions. WHen the count is Zero enable the Cron jobs.\nCurrent count is ${NEW_MESSAGE_COUNT3}." | mail -s "${EMAIL_SUBJECT}" "${EMAIL_RECIPIENTS}"
-            exit 0
-        fi
-    fi
-}
-
-############################################# Check the contents of the last line and take action based on it
-if [[ $LASTLINE == *"Messages are Stuck."* ]] || [[ $LASTLINE == *"Message Count is increasing."* ]]; then
-    echo "$(date +'%Y-%m-%d %H:%M:%S') CDT - SV messages are found to be stuck. Taking action..."
-    # Get the total number of messages to be processed
-    echo "$(date +'%Y-%m-%d %H:%M:%S') CDT - Getting count of messages to be processed."
-    MESSAGE_COUNT=$( sqlplus -s 'NM00/2022!NMp$wd'@cpacnmqp <<EOF
-    set heading off
-    set feedback off
-    select count(*) from sv_message_queue_hist where delete_ts is null and insert_ts < sysdate - 15/1440;
-    exit;
-EOF
-)
-    echo "$(date +'%Y-%m-%d %H:%M:%S') CDT - There are ${MESSAGE_COUNT} messages to be processed."
-    if [[ ${MESSAGE_COUNT} -eq 0 ]]; then
-        # No messages to process, exit script
-        echo "$(date +'%Y-%m-%d %H:%M:%S') CDT - Current Count is Zero. Exiting from script."
-        exit 0
-    fi
-
-    #set the variables
-    LOGFILE="/u/netwdm2/log/lnplistener_console.log"
-    ERROR_PATTERN="lang"
-    LISTENER_PID="9523"
-
-    # Check if the listener is up
-    echo "Checking listener status"
-    if netstat -an | grep "$LISTENER_PID" >/dev/null; then
-        echo "$(date +'%Y-%m-%d %H:%M:%S') CDT - Listener is already up"
-    else
-        start_listener
-
-        if netstat -an | grep "$LISTENER_PID" >/dev/null; then
-            echo "$(date +'%Y-%m-%d %H:%M:%S') CDT - Listener has been brought back up since it was already down"
-            echo -e "$(date +'%Y-%m-%d %H:%M:%S') CDT - Listener has been brought back up since it was already down. The Automation script is still running and continuing its checks." | mail -s "${EMAIL_SUBJECT}" "${EMAIL_RECIPIENTS}"
-        else
-            echo "$(date +'%Y-%m-%d %H:%M:%S') CDT - Listener is still down after attempting to bring it back up. Please investigate. Exiting the Automation Script."
-            echo -e "$(date +'%Y-%m-%d %H:%M:%S') CDT - Listener is still down after attempting to bring it back up. Please investigate." | mail -s "${EMAIL_SUBJECT}" "${EMAIL_RECIPIENTS}"
-            exit 1
-        fi
-    fi
-
-    # Check if the logfile contains any errors
-    echo "Checking for error patterns in the console_log."
-    if grep "$ERROR_PATTERN" "$LOGFILE"; then
-        echo "$(date +'%Y-%m-%d %H:%M:%S') CDT - Error found in ${LOGFILE}. Bouncing the listener."
-        bounce_listener
-        echo "$(date +'%Y-%m-%d %H:%M:%S') CDT - listener has been Bounced. Passing batches through URL."
-    else
-        echo "$(date +'%Y-%m-%d %H:%M:%S') CDT - No error pattern found in the lnplistener_console.log."
-    fi
-
-    #processing batches through URL
-    process_batch_seq
-    validation
-
-else
-    echo "$(date +'%Y-%m-%d %H:%M:%S') CDT - No stuck messages. Stopping the script"
+if [[ $LASTLINE != *"Messages are Stuck."* ]] && [[ $LASTLINE != *"Message Count is increasing."* ]]; then
+    log "No 'Stuck' or 'Increasing' status found. No action needed. Exiting."
     exit 0
 fi
+
+log "Problem detected: '${LASTLINE}'. Starting automated recovery process."
+
+# --- Stage 1: Initial Check and Action ---
+
+# Check if the listener process is running
+log "Checking listener status on port ${LISTENER_PORT}."
+if netstat -an | grep -w "${LISTENER_PORT}" >/dev/null; then
+    log "Listener is running."
+    # Check listener log for errors
+    if grep -E -q "${LOG_ERROR_PATTERN}" "${LISTENER_CONSOLE_LOG}"; then
+        log "ERROR pattern found in listener log. Bouncing the listener."
+        bounce_listener
+    else
+        log "No error pattern found in listener log."
+    fi
+else
+    log "Listener is DOWN. Attempting to start it."
+    start_listener
+    sleep 5 # Give it time to start
+    if netstat -an | grep -w "${LISTENER_PORT}" >/dev/null; then
+        log "Listener started successfully."
+        echo "The application listener was found to be down and has been restarted by the automation script." | mail -s "${EMAIL_SUBJECT_PREFIX} - Listener Restarted" "${EMAIL_RECIPIENTS}"
+    else
+        log "CRITICAL: Failed to start the listener. Manual intervention required."
+        echo "The application listener was found to be down and COULD NOT be restarted automatically. Please investigate immediately." | mail -s "${EMAIL_SUBJECT_PREFIX} - CRITICAL: Listener Start Failed" "${EMAIL_RECIPIENTS}"
+        exit 1
+    fi
+fi
+
+# Get current count before taking action
+INITIAL_COUNT=$(sqlplus -s "${DB_CONNECTION}" <<< "set heading off feedback off pagesize 0; select count(*) from ${BACKLOG_TABLE} where delete_ts is null and insert_ts < sysdate - ${STUCK_THRESHOLD_MINUTES}/1440;")
+INITIAL_COUNT=$(echo "${INITIAL_COUNT}" | xargs)
+if [[ ${INITIAL_COUNT} -eq 0 ]]; then
+    log "Count is already zero. Problem may have self-resolved. Exiting."
+    exit 0
+fi
+
+log "Attempting to reprocess stuck batches (Attempt 1)..."
+process_stuck_batches
+
+# --- Stage 2: First Validation ---
+
+STATUS=$(run_validation_check "${INITIAL_COUNT}")
+if [[ "$STATUS" == "CLEAR" || "$STATUS" == "IMPROVING" ]]; then
+    log "SUCCESS: Message count is decreasing after initial action. Exiting."
+    exit 0
+fi
+
+# --- Stage 3: Escalation (Bounce and Reprocess) ---
+
+log "WARNING: Queue is still stuck after first attempt. Bouncing listener and trying again."
+bounce_listener
+
+# Get new count before second attempt
+CURRENT_COUNT=$(sqlplus -s "${DB_CONNECTION}" <<< "set heading off feedback off pagesize 0; select count(*) from ${BACKLOG_TABLE} where delete_ts is null and insert_ts < sysdate - ${STUCK_THRESHOLD_MINUTES}/1440;")
+CURRENT_COUNT=$(echo "${CURRENT_COUNT}" | xargs)
+
+log "Attempting to reprocess stuck batches (Attempt 2)..."
+process_stuck_batches
+
+# --- Stage 4: Final Validation ---
+
+STATUS=$(run_validation_check "${CURRENT_COUNT}")
+if [[ "$STATUS" == "CLEAR" || "$STATUS" == "IMPROVING" ]]; then
+    log "SUCCESS: Message count is decreasing after bouncing listener. Exiting."
+    exit 0
+fi
+
+# --- Stage 5: Final Alert ---
+
+FINAL_COUNT=$(sqlplus -s "${DB_CONNECTION}" <<< "set heading off feedback off pagesize 0; select count(*) from ${BACKLOG_TABLE} where delete_ts is null and insert_ts < sysdate - ${STUCK_THRESHOLD_MINUTES}/1440;")
+FINAL_COUNT=$(echo "${FINAL_COUNT}" | xargs)
+
+log "FAILURE: Automated recovery failed. Sending alert for manual intervention."
+EMAIL_BODY="Automated recovery for the SV Message Queue has failed.
+The message count remains stuck or is increasing after all automated steps were taken.
+
+Actions Performed:
+1. Checked/Restarted Listener
+2. Reprocessed top batches via URL
+3. Bounced Listener
+4. Reprocessed top batches again
+
+The current backlog count is: ${FINAL_COUNT}.
+
+RECOMMENDATION:
+1. Manually investigate the application and database logs for the root cause.
+2. Disable the automation cron jobs to prevent repeated alerts.
+3. Once the issue is resolved and the queue is clear, re-enable the cron jobs."
+
+echo -e "${EMAIL_BODY}" | mail -s "${EMAIL_SUBJECT_PREFIX} - ACTION REQUIRED: Automated Recovery Failed" "${EMAIL_RECIPIENTS}"
+
+exit 1
